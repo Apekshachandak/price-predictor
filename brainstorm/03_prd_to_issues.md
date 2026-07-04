@@ -184,67 +184,69 @@ early_stopping_rounds=50
 
 ---
 
-## ISSUE #9 — CLIP Image Embedding Extraction (Kaggle GPU)
+## ISSUE #9 — DINOv2 Image Embedding Extraction (Kaggle GPU)
 **Status:** `[x] Done` — **Manual step, run on Kaggle**
 **Estimated Time:** 1 hour (includes upload, run, download)
 
 ### What to do
 1. Go to kaggle.com → Create New Notebook
 2. Settings → Accelerator → GPU T4 x2
-3. Upload the `images/` folder as a Kaggle Dataset
-4. Paste the extraction code from `implementation_plan.md` Step 9
-5. Run the notebook (~10 minutes)
-6. Download `clip_embeddings.npy` and `clip_sku_ids.npy`
-7. Place both files in `tile_pricing_challenge/embeddings/`
+3. Upload the `data/` + `images/` folders as a Kaggle dataset
+4. Set `USE_DINOV2=1` in the notebook config
+5. Run the notebook — DINOv2 weights download automatically from `facebookresearch/dinov2`
+6. Embeddings extracted in batches of 64, with multi-crop averaging (N=3 crops from the 4:1 strip)
 
-### What CLIP does
-CLIP is a model pre-trained on hundreds of millions of image-text pairs. Given a tile photo, it produces a 512-number vector that captures the visual "character" of the tile — whether it looks like marble, wood, concrete, whether it's intricate or plain. We use these numbers as additional features.
+### What DINOv2 does
+DINOv2 is a self-supervised Vision Transformer trained without labels on curated internet images. Unlike CLIP (which optimises for text-image alignment), DINOv2 is trained to produce visually coherent embeddings — making it far better at capturing texture, material, and surface pattern. For tile images (marble, concrete, wood-look, polished stone), this distinction matters. We use the frozen encoder and average embeddings across 3 square crops of each 4:1 strip image.
 
 ### Definition of Done
-- `embeddings/clip_embeddings.npy` exists locally
-- `embeddings/clip_sku_ids.npy` exists locally
-- Shape of `clip_embeddings.npy` is `(2840, 512)`
+- `notebook0b5c33f912.ipynb` ran successfully on Kaggle GPU
+- `DINOv2 [dinov2_vits14] on cuda -> (2272, 384)` printed in output
+- `submission.csv` produced with 568 predictions
 
 ---
 
-## ISSUE #10 — Add Image Features to Model
+## ISSUE #10 — Image Fusion Experiments (5 Strategies × 2 CV Schemes)
 **Status:** `[x] Done`
-**Estimated Time:** 45 minutes
+**Estimated Time:** 45 minutes (runs inside the main notebook)
 
 ### What to do
-- Load `clip_embeddings.npy` and `clip_sku_ids.npy`
-- Build a lookup dictionary: `sku_id → 512-number vector`
-- Align embeddings to the order of `train_df["sku_id"]` and `test_df["sku_id"]`
-- Apply PCA (Principal Component Analysis) to reduce 512 dimensions to 50
-  - Fit PCA on training embeddings only
-  - Transform both train and test using the same PCA
-- Add 50 new columns (`clip_pca_0` ... `clip_pca_49`) to `X_train` and `X_test`
-- Retrain XGBoost with the same cross-validation setup
-- Compare metrics: did images help?
+All done inside `tile_pricing_final.ipynb`.
+
+For each image representation (classical 22-dim + DINOv2 384-dim), run 5 fusion strategies:
+- **base** — tabular only (control)
+- **direct** — tabular + PCA-reduced image features concatenated
+- **stack** — tabular + out-of-fold `image→price` prediction as meta-feature
+- **knn** — tabular + mean log-price of the 5 visually nearest training tiles (image kNN prior)
+- **both** — stack + knn
+
+Run each under both random 5-fold and GroupKFold CV.
+
+### Key Findings
+- Under random CV: **no fusion strategy improves on tabular-only**. The collection encoding saturates the metric.
+- Under GroupKFold: **DINOv2-direct gives the best result (+4.5pp over tabular baseline)**, confirming images carry real signal for generalisation to unseen product lines.
+- `stack` and `knn` strategies can hurt under distribution shift.
 
 ### Definition of Done
-- `X_train_with_images` has shape `(2272, N_features + 50)`
-- Model retrained without error
-- Metrics table shows before-vs-after comparison
+- Results table printed for all experiments under both CV schemes
+- No image strategy selected for final submission (tabular EB-shrink wins on random CV)
 
 ---
 
 ## ISSUE #11 — Generate Submission File
 **Status:** `[x] Done`
-**Estimated Time:** 30 minutes
+**Estimated Time:** built into `tile_pricing_final.ipynb`
 
 ### What to do
-- Create `notebooks/03_submission.ipynb`
-- Choose the best model (with or without images, based on cross-validation score)
-- Take the averaged test predictions (log-price), convert back to actual price with `exp()`
-- Create a dataframe with two columns: `sku_id` and `price_usd_per_sqm`
-- Verify: 568 rows, no NaN values, all prices are positive and reasonable (e.g., between $5 and $500)
-- Save to `outputs/predictions.csv`
+- Final model: XGBoost + LightGBM blend with EB-shrunk collection encoding (`smooth=10`)
+- Refit both models on all 2,272 training rows (collection stats computed on full train set)
+- Average predictions (equal weight) in log-price space, then exponentiate
+- Write `outputs/submission.csv` with two columns: `sku_id` and `price_usd_per_sqm`
 
 ### Definition of Done
-- `outputs/predictions.csv` exists with 568 rows
+- `outputs/submission.csv` exists with 568 rows
+- Prediction range: $5.89–$33.99 (train range: $5.96–$33.56)
 - No NaN or negative values
-- File has exactly two columns: `sku_id` and `price_usd_per_sqm`
 
 ---
 
@@ -280,11 +282,11 @@ Write as if explaining to a technical teammate who wasn't there. Be specific —
 | #2 | Load Raw Data | `[x]` |
 | #3 | Parse Nested Fields | `[x]` |
 | #4 | Feature Engineering | `[x]` |
-| #5 | EDA (8 Charts) | `[x]` |
+| #5 | EDA | `[x]` (inline in `tile_pricing_final.ipynb`) |
 | #6 | Build Feature Matrix | `[x]` |
 | #7 | Train XGBoost with Cross-Validation | `[x]` |
-| #8 | SHAP Feature Importance | `[x]` |
-| #9 | CLIP Embedding Extraction (Kaggle) | `[x]` |
-| #10 | Add Image Features + Retrain | `[x]` — images degraded accuracy; tabular-only model selected |
-| #11 | Generate Submission File | `[x]` |
-| #12 | Write Analysis Write-Up | `[x]` |
+| #8 | LightGBM + Ensemble + EB Shrinkage | `[x]` |
+| #9 | DINOv2 Embedding Extraction (Kaggle) | `[x]` |
+| #10 | 5-Strategy Image Fusion Experiments | `[x]` — images don't improve random CV; DINOv2-direct best on GroupKFold |
+| #11 | Generate Submission File | `[x]` — tabular EB-shrink wins; submission.csv in `outputs/` |
+| #12 | Write Analysis Write-Up | `[x]` (README.md) |

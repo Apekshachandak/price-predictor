@@ -69,11 +69,15 @@ Each row is one SKU with these categories of fields:
 - Train XGBoost gradient boosting model with 5-fold cross-validation
 - Generate SHAP feature importance for explainability
 
-### Phase 2 — Multimodal Enhancement
-- Extract 512-dimensional visual embeddings from all tile photos using OpenAI's CLIP model (pre-trained, no fine-tuning)
-- Reduce to 50 dimensions using Principal Component Analysis to avoid overfitting
-- Append image features to structured feature table
-- Retrain model, compare metrics
+### Phase 2 — Multimodal Investigation
+- **Image Rep A:** Extract 22 compact interpretable "look" features per tile (HSV colour, colorfulness, texture richness via Sobel/FFT/entropy, gloss, tonal complexity) — no DL required, interpretable, CPU-only
+- **Image Rep B:** Extract 384-dimensional visual embeddings using **DINOv2 ViT-S/14** (self-supervised, superior texture/material features vs. CLIP). Run frozen inference on Kaggle GPU with multi-crop averaging to respect the 4:1 tile strip format
+- Test **five fusion strategies** under both CV schemes (random 5-fold and GroupKFold):
+  - `base` — tabular only
+  - `direct` — tabular + PCA-reduced image features
+  - `stack` — tabular + out-of-fold image→price prediction as meta-feature
+  - `knn` — tabular + image kNN price prior (mean price of 5 nearest visual neighbours)
+  - `both` — stack + knn
 
 ### Phase 3 — Analysis and Submission
 - Select best model (with or without images based on validation score)
@@ -92,17 +96,14 @@ Each row is one SKU with these categories of fields:
 | `finish_keyword` | Regex match on `product_name` | Pulido/Brillo/Mate/Antislip — more granular than structured `finish_type` |
 | `app_combo` | Parsed from `application_location` list | Wall+Floor tiles command a premium over Wall-only |
 | `log_price` | `log(price_usd_per_sqm)` | Normalises right-skewed target distribution |
-| `collection_mean_price` | Mean price per collection (train only, fold-safe) | Collection is the primary quality-tier proxy |
-| `collection_std_price` | Standard deviation per collection | Captures intra-collection price spread |
+| `col_mean` | EB-shrunk mean log-price per collection (fold-safe, `smooth=10`) | Single most important feature; shrinkage stabilises thin collections |
+| `col_std` | Std deviation per collection | Captures intra-collection variability |
+| `col_cnt` | SKU count per collection | Feeds shrinkage calculation; proxy for product line size |
 | `body_type` | Direct categorical | Color-Body vs. Red-Body carries meaningful price signal |
 | `shade_variation_rating` | Direct categorical (V1–V4) | Higher variation tiles are systematically more expensive |
 | `edge_type` | Direct categorical | Pressed/Cushioned vs. Rectified |
-| `barefoot_val` | Ordinal from `barefoot_wet_slip_rating` | Class C (highest safety) commands a premium |
-| `pendulum_val` | Ordinal from `pendulum_slip_class` | Slip resistance class as integer |
-| `r_rating_val` | Integer extracted from `r_rating` | Surface grip rating (R9–R11) |
-| `breaking_strength_val` | Numeric from nested object | r = 0.31 with log-price |
-| `*_is_missing` flags | 1 if field is null, else 0 | Missingness itself is informative — budget tiles skip certification |
-| `clip_pca_0` to `clip_pca_49` | CLIP embedding → PCA 50 dims | Visual aesthetics (marble/wood/concrete) not in structured data |
+| `finish_type`, `color_family`, `subcategory`, `piece_type`, `is_glazed` | Direct categoricals | Additional market segment signals |
+| `*_miss` flags | 1 if field is null, else 0 | Missingness itself is informative — budget tiles skip certification |
 
 ---
 
@@ -110,11 +111,11 @@ Each row is one SKU with these categories of fields:
 
 | Skipped | Reason |
 |---|---|
-| Fine-tuning CLIP on tile images | Needs more time and training data management; overkill for 3-day scope |
+| Fine-tuning DINOv2 on tile images | Needs contrastive setup and careful data management; documented as future work |
 | One-hot encoding collection names | 200+ collections = 200+ sparse columns, causes overfitting on small dataset |
 | Training a custom image regression network | Insufficient data, insufficient time, diminishing returns vs. pre-extracted features |
-| Ensembling many models (blending 10+ models) | Marginal gain, disproportionate complexity for intern assignment |
-| Hyperparameter grid search | Replaced by Optuna with 30 trials — faster and smarter |
+| Ensembling many models (blending 10+ models) | Only XGBoost+LightGBM blend used — clean, interpretable, no marginal complexity |
+| Hyperparameter grid search | Reasonable defaults used; Optuna search noted as future work |
 
 ---
 
@@ -122,12 +123,9 @@ Each row is one SKU with these categories of fields:
 
 | File | Description |
 |---|---|
-| `notebooks/01_EDA.ipynb` | Exploratory analysis with 8 charts and written observations |
-| `notebooks/02_model.ipynb` | Tabular feature matrix, XGBoost 5-fold CV, SHAP analysis |
-| `notebooks/03_final_submission.ipynb` | Side-by-side tabular vs. multimodal ablation, auto-selects best model |
-| `notebooks/kaggle_clip_extraction.py` | GPU script for CLIP embedding extraction (run on Kaggle) |
+| `notebooks/tile_pricing_final.ipynb` | End-to-end notebook: data loading, EDA, tabular features, 2 image reps, 5 fusion strategies, performance boosts, final submission |
 | `outputs/submission.csv` | Predicted `price_usd_per_sqm` for all 568 test SKUs |
-| `write_up.md` | Written narrative: what I found, what I tried, what I'd do next |
+| `README.md` | Written narrative: what I found, what I tried, results, what I'd do next |
 
 ---
 
@@ -136,7 +134,7 @@ Each row is one SKU with these categories of fields:
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | Collection leakage in target encoding | Medium | High | Compute collection stats inside CV folds only |
-| CLIP embeddings don't improve score | **Confirmed** | Low | Structured model is the final submission; image experiment documented as honest finding |
+| Images don't improve in-distribution score | **Confirmed** | Low | EB-shrunk tabular model is final submission; image value confirmed for GroupKFold (unseen collections) |
 | Test has new collections not in train | Low | Medium | Fall back to global mean for unknown collections |
 | Kaggle GPU notebook crashes | Low | Medium | Save embeddings incrementally in batches |
 
