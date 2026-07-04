@@ -1,63 +1,58 @@
 # Tile Price Prediction — Write-Up
 
-
-
 ## How I Approached This
 
-Before writing any code, I spent time brainstorming and stress-testing my plan. I structured this as a three-phase process — each phase documented in the `brainstorm/` folder:
+Before writing any code, I spent time stress-testing my plan. I've structured this process across three documents in the `brainstorm/` folder:
 
-1. **Grill Me** (`brainstorm/01_grill_me.md`) — I interrogated every assumption: why would a model work here, what's the biggest risk (collection leakage), why XGBoost over a neural net, why log-price, what if images don't help? The goal was to catch bad decisions before they cost time.
+1. **Grill Me** (`brainstorm/01_grill_me.md`) — I interrogated every decision upfront: why would a model work here, what's the biggest risk, why log-price, why XGBoost, what does the GroupKFold tell us that random CV doesn't? The goal was to catch bad assumptions before they cost hours of work.
 
-2. **Product Requirements** (`brainstorm/02_prd.md`) — I formalised the feature engineering plan: which fields to parse, what to engineer, how to handle missingness, how to use collection statistics without memorising them, and how to properly investigate image-fusion strategies.
+2. **Product Requirements** (`brainstorm/02_prd.md`) — I formalised the feature engineering plan and the multimodal investigation strategy before touching the data.
 
-3. **Issues Breakdown** (`brainstorm/03_prd_to_issues.md`) — I broke the work into concrete tasks with acceptance criteria, so I could track progress and avoid scope creep.
+3. **Issues Breakdown** (`brainstorm/03_prd_to_issues.md`) — I broke the work into concrete, trackable tasks with clear definitions of done.
 
-This upfront thinking shaped every downstream decision. Most of the "hard" work happened here — the code was just execution.
+This upfront thinking shaped every downstream decision. The brainstorm docs aren't an afterthought — they're where most of the actual reasoning happened.
 
 ---
 
 ## What I Found in the Data
 
 ### Price Distribution
-The 2,272 training tiles range from **$5.96 to $33.56/m²**, with a median around **$12.74/m²**. The distribution is right-skewed, and viewing it on a log scale reveals discrete pricing clusters at fixed intervals. This isn't a smooth market — it's structured manufacturer pricing, where tiles are placed into deliberate brackets tied to product tiers.
 
-Training on `log(price)` and converting back at inference time normalises this skewness and ensures the model treats proportional errors fairly. Being off by $2 on a $10 tile is a bigger mistake than being off by $2 on a $30 tile — log-transformation encodes that intuition naturally.
+The 2,272 training tiles range from **$5.96 to $33.56/m²**, with a median around **$12.74/m²**. The distribution is right-skewed, and on a log scale you can see discrete pricing clusters at fixed intervals. This isn't a smooth open market — it's structured manufacturer pricing, where tiles sit in deliberate brackets tied to product tier. Training on `log(price)` and converting back at inference normalises this skewness and ensures proportional errors are treated fairly: being off by $2 on a $10 tile matters more than being off by $2 on a $30 tile.
 
 ### Collection Is the Dominant Signal
-Every one of the 160 test collections is seen in training — zero unseen collections. Within-collection log-price standard deviation (median: 0.069) is less than a quarter of the overall spread (0.318). The collection is effectively a product-line quality tier, and knowing which family a tile belongs to immediately narrows the price range.
+
+Every one of the 160 test collections appears in the training set — zero unseen collections. Within-collection log-price standard deviation (median: **0.069**) is less than a quarter of the overall spread (**0.318**). Knowing which product family a tile belongs to immediately narrows its price range to a tight band. This is the structural fact that shapes everything else in the model.
 
 ### Size Is the Strongest Numerical Lever
-The README hinted that size drives per-m² price, and the data confirmed it emphatically. Each tile's dimensions are stored as nested JSON objects (`{"value": 1200.0, "comparator": "=", "unit": "mm"}`), which required careful parsing. From the extracted width, length, and thickness, I engineered:
 
-- **Tile volume** (`width × length × thickness`) — Pearson correlation **r = 0.45** with log-price, the strongest single numeric feature. Bigger, thicker tiles cost more to manufacture, are heavier to ship, and break more easily in transit.
-- **Tile area** (`width × length`) — r = 0.40. Volume beat area because the thickness dimension carries real signal: a 6mm slab-format tile and a 20mm outdoor paver have very different cost structures.
-- **Aspect ratio** (`length / width`) — captures format differences. Long, narrow plank tiles (simulating wood) price differently from square tiles of the same area.
+Each tile's dimensions are stored as nested JSON objects (`{"value": 1200.0, "comparator": "=", "unit": "mm"}`), which required careful parsing. From the extracted width, length, and thickness, I engineered:
 
-### Missingness Is Structural, Not Random
-The dataset has 60+ fields, and many technical ratings (PEI wear, slip resistance, water absorption) are null for 30–65% of products. This isn't data quality noise — it's a structural signal. Budget tiles don't go through certification labs. When a tile has no PEI rating and no slip test result, it's almost certainly a basic wall tile, not a premium floor product.
+- **Tile volume** (`width × length × thickness`) — Pearson **r = 0.45** with log-price, the strongest single numeric feature. Bigger, thicker tiles cost more to produce, ship, and handle.
+- **Tile area** (`width × length`) — r = 0.40. Volume edges it out because thickness carries real signal: a 6mm wall tile and a 20mm outdoor stoneware paver have very different cost structures.
+- **Aspect ratio** (`max(w,l) / min(w,l)`) — long plank tiles (simulating wood flooring) price differently from square tiles of the same area.
 
-Rather than imputing missing values (which would inject false information), I created boolean `_miss` flags for each technical field. XGBoost can then learn the rule: "if PEI rating is missing AND water absorption is missing, this tile is probably in the $8–$10 bracket." These flags turned out to be among the top features.
+### Missingness Is Structural, Not Noise
 
-### Collection Encoding — Done Carefully
-Tiles within the same collection share materials, finishes, and target markets. Their prices cluster tightly — most collections have a within-collection coefficient of variation below 0.05.
+The dataset has 60+ fields, and many technical ratings — PEI wear, slip resistance, water absorption — are null for 30–65% of products. Budget tiles simply don't go through certification labs. When a tile has no PEI rating and no slip test result, it's almost certainly a basic wall tile, not a premium floor product.
 
-I used **empirical-Bayes (EB) shrinkage** for collection encoding: each collection is represented by its mean price, shrunk toward the global mean proportional to how many examples it has. A collection with only 2 SKUs shouldn't be trusted with a raw mean — shrinkage stabilises thin collections without affecting large, well-sampled ones. This is computed **exclusively from training data within each cross-validation fold** to prevent leakage.
-
-`collection_mean_price` was the single most important feature in the model — confirming the intuition that product-line positioning explains most of the price variance.
+Rather than imputing these missing values (which would inject false information), I created boolean `_miss` flags for each technical field. XGBoost can learn: "if PEI is missing AND water absorption is missing, this tile is probably in the $8–$10 bracket." These flags consistently ranked in the top features by importance.
 
 ### Finish Keywords from Product Names
-The structured `finish_type` field only has three values (Matte, Glossy/Polished, and null). But the product name follows a consistent pattern — `[Collection] [Color] [Finish] [Size] [Extras]` — and encodes much richer finish information. A regex extraction yields keywords like `Pulido` (polished), `Brillo` (glossy), `Mate` (matte), `Lappato`, `Satin`, and `Antislip`, each with clean price separation.
+
+The structured `finish_type` field has only three values: Matte, Glossy/Polished, and null. But the product name follows a consistent pattern — `[Collection] [Color] [Finish] [Size] [Extras]` — and encodes much richer finish information. A regex extraction yields keywords like `Pulido` (polished), `Brillo` (glossy), `Mate` (matte), `Lappato`, `Satin`, and `Antislip`, each with clear and distinct price separation.
 
 ### Categorical Features With Real Signal
-A full audit of all 60+ fields surfaced several categorical features that meaningfully separate price tiers:
 
-| Feature | Finding |
+A full audit of the structured fields surfaced several categorical features that meaningfully separate price tiers:
+
+| Feature | Key Finding |
 |---|---|
-| **Body type** | Color-Body > Neutral-Body > White-Body > Red-Body. Clay composition directly affects material cost. |
-| **Shade variation** | V3/V4 (high pattern variation) tiles are more expensive. Complex surface patterns require more manufacturing precision. |
-| **Edge type** | Pressed/Cushioned edges vs. Rectified. Older decorative formats command premiums in niche segments. |
-| **Barefoot slip rating** | Class C (highest grip) vs. Class A. High safety ratings indicate premium commercial-grade tiles. |
-| **Application location** | Wall+Floor tiles (dual-purpose, more durable) command a premium over Wall-only tiles. |
+| **Body type** | Color-Body tiles carry a clear premium over Neutral-Body, White-Body, and Red-Body. Clay composition directly affects manufacturing cost. |
+| **Shade variation** | V3/V4 (high pattern variation) tiles are systematically more expensive — complex surface patterns require more precision. |
+| **Edge type** | Pressed and cushioned edges vs. rectified. Decorative formats command premiums in specific market segments. |
+| **Application location** | Dual-purpose Wall+Floor tiles (more durable, pass more tests) command a premium over Wall-only. |
+| **Subcategory and piece type** | Additional market segment signals that the model learns to use. |
 
 ---
 
@@ -65,101 +60,96 @@ A full audit of all 60+ fields surfaced several categorical features that meanin
 
 | Feature | How It's Built | Why It Matters |
 |---|---|---|
-| `vol` | width × length × thickness | Strongest numeric predictor (r = 0.45); captures material mass |
+| `vol` | width × length × thickness | Strongest numeric predictor; captures material mass and manufacturing cost |
 | `area` | width × length | Direct manufacturing cost proxy |
 | `aspect` | max(w,l) / min(w,l) | Plank vs. square format pricing |
-| `finish_kw` | Regex from `product_name` | More granular than `finish_type` (Pulido/Brillo/Mate/Lappato/Satin/Antislip) |
-| `app` | Parsed `application_location` list | Wall+Floor vs. Wall-only |
-| `col_mean` | EB-shrunk mean log-price per collection (fold-safe) | Single most important feature |
-| `col_std` | Std deviation per collection | Captures intra-collection variability |
-| `col_cnt` | SKU count per collection | Feeds into shrinkage and is a proxy for line size |
-| `*_miss` flags | 1 if field is null, 0 if present | Missingness correlates with product tier |
-| `body_type`, `shade_variation_rating`, `edge_type` | Direct categoricals | Each separates price tiers clearly |
+| `finish_kw` | Regex from `product_name` | 9 categories; far more granular than the structured `finish_type` |
+| `app` | Parsed `application_location` | Wall+Floor vs. Wall-only and other combos |
+| `col_mean` | EB-shrunk mean log-price per collection (fold-safe) | Single most important feature by a wide margin |
+| `col_std` | Std deviation per collection | Captures intra-collection price spread |
+| `col_cnt` | SKU count per collection | Feeds the shrinkage calculation |
+| `*_miss` flags | 1 if field is null, 0 if present | Missingness encodes product tier |
+| `body_type`, `shade_variation_rating`, `edge_type` | Direct categoricals | Each cleanly separates price tiers |
 | `finish_type`, `color_family`, `subcategory`, `piece_type`, `is_glazed` | Direct categoricals | Additional market segment signals |
 
 ---
 
 ## Model and Training
 
-### Why XGBoost (with LightGBM ensemble)
-With 2,272 training rows, neural networks would overfit without heavy regularisation. XGBoost is built for exactly this regime: small-to-medium tabular data with missing values. It handles NaNs natively, trains in seconds, and produces interpretable predictions. For a submission where showing your reasoning matters as much as accuracy, interpretability is a feature, not a nice-to-have.
+### Why XGBoost + LightGBM
 
-The final submission blends XGBoost + LightGBM with equal weight. Both models share the same CV structure but have different error profiles (different tree construction algorithms), so blending reduces variance.
+With 2,272 training rows, gradient boosting is the right tool. Both XGBoost and LightGBM are designed for small-to-medium tabular data, handle NaNs natively (learning the optimal split direction for missing values at each node), and produce interpretable predictions. They also have complementary tree construction algorithms — XGBoost builds trees level-by-level; LightGBM uses leaf-wise growth — which means their errors don't perfectly correlate. A 50/50 blend of both in log-price space reduces variance without adding complexity.
 
 ### Cross-Validation Strategy
-Two CV schemes were run:
-- **Random 5-fold** — mirrors the real test distribution (all collections seen in training). This is the primary metric.
-- **GroupKFold by collection** — the harder regime: some product lines are completely held out. Used to assess generalisation and understand where images add value.
 
-Each fold computes collection statistics from **training rows only** — never touching the validation set. Empirical-Bayes shrinkage (`smooth=10.0`) stabilises small collections.
+I ran two CV schemes in parallel:
 
-### Image Representations — Systematic Investigation
-I ran two image representations and five fusion strategies — a proper ablation rather than one-shot test:
+**Random 5-fold** is the primary metric. It mirrors the actual test condition: all test collections appear in training, so the model needs to generalise within known product lines. Each fold computes collection statistics from the training portion only — never touching the validation set.
 
-**Image Rep A — 22 compact "look" features (no DL):** Computed directly from pixel statistics — colour channels (HSV), colorfulness (Hasler-Süsstrunk), texture richness (Sobel edges, FFT high-frequency energy, image entropy), gloss (specular highlight area), tonal complexity. Human-interpretable, no GPU needed.
+**GroupKFold by collection** is the harder regime: some product lines are completely held out of training. This tells me how the model behaves with genuinely new product lines, and it's the regime where the visual features add measurable value.
 
-**Image Rep B — DINOv2 ViT-S/14 embeddings:** Self-supervised vision transformer, far stronger than CLIP for texture/material understanding. 384-dimensional embeddings extracted with multi-crop averaging (respecting the 4:1 tile strip format). Run on Kaggle GPU, PCA-reduced to 32 dimensions for the "direct" fusion variant.
+### Empirical-Bayes Collection Encoding
 
-**Five fusion strategies (all fold-safe):**
-- `base` — tabular only
-- `direct` — tabular + PCA-reduced image features concatenated
-- `stack` — tabular + out-of-fold image→price prediction as a single meta-feature
-- `knn` — tabular + mean log-price of the k=5 visually nearest training tiles (image kNN prior)
+The collection name is encoded as its mean log-price, shrunk toward the global mean:
+
+```
+col_mean_shrunk = (n × raw_mean + smooth × global_mean) / (n + smooth)
+```
+
+With `smooth=10`, a collection with only 2 SKUs gets its estimate pulled most of the way to the global mean. A collection with 50 SKUs is barely affected. This stabilises thin collections and improved the primary CV metric over raw mean encoding.
+
+### Image Investigation — DINOv2
+
+The README notes that photos are optional but rewarded. There's real visual information in these tiles — texture, grain pattern, gloss level, surface complexity — that the structured fields only partly capture.
+
+I extracted 384-dimensional embeddings using **DINOv2 ViT-S/14** (Meta's self-supervised Vision Transformer, pre-trained on curated image data). DINOv2 is particularly strong at texture and material understanding, which is exactly the relevant signal for tile images. Inference runs frozen — no fine-tuning — on Kaggle GPU, with multi-crop averaging to handle the 4:1 landscape strip format.
+
+I also computed **22 compact, interpretable "look" features** directly from pixel statistics: HSV colour channels, colorfulness (Hasler–Süsstrunk metric), texture richness (Sobel edge density, FFT high-frequency energy, image entropy), gloss level (specular highlight area), and tonal complexity. These are CPU-only and human-readable.
+
+**Five fusion strategies** were tested systematically under both CV schemes:
+- `base` — tabular only (the control)
+- `direct` — tabular + PCA-reduced image features concatenated directly
+- `stack` — tabular + an out-of-fold `image → price` prediction as a single meta-feature
+- `knn` — tabular + mean log-price of the 5 visually nearest training tiles (image kNN prior)
 - `both` — stack + knn combined
 
 ---
 
 ## Results
 
-Two CV regimes, 10+ experiments:
+### Random 5-Fold CV (mirrors the real test)
 
-### Random 5-Fold CV (mirrors real test — all collections seen)
 | Experiment | RMSE (log) | Within ±10% | Within ±20% |
 |---|---|---|---|
-| **tabular_EBshrink (WINNER)** | **0.0440** | **97.67%** | **98.94%** |
+| **tabular + EB-shrinkage (WINNER)** | **0.0440** | **97.67%** | **98.94%** |
 | ensemble_xgb_lgb | 0.0464 | 97.54% | 98.64% |
 | dino_stack | 0.0471 | 97.45% | 98.64% |
-| dino_base (tabular baseline) | 0.0448 | 97.40% | 98.86% |
+| tabular_base | 0.0448 | 97.40% | 98.86% |
 | classical image (all fusions) | 0.0448–0.0492 | 97.0–97.4% | 98.5–98.9% |
 
-### GroupKFold (unseen product lines — robustness regime)
+### GroupKFold (unseen product lines — generalisation regime)
+
 | Experiment | RMSE (log) | Within ±10% |
 |---|---|---|
-| **dino_direct (BEST here)** | **0.1281** | **69.89%** |
-| classical_both | 0.1358 | 66.37% |
-| dino_both | 0.1351 | 66.11% |
+| **DINOv2-direct (BEST here)** | **0.1281** | **69.89%** |
+| classical features + both | 0.1358 | 66.37% |
 | tabular_base | 0.1372 | 65.36% |
 
-**The tabular model with EB-shrinkage is the final submission.** Adding image features doesn't improve the in-distribution metric — the collection encoding already saturates the price signal. However, DINOv2 gives a clear +4.5 percentage point lift under GroupKFold, proving images do carry real information for tiles outside known collections.
+**The final submission uses the tabular model with EB-shrinkage.** This configuration wins on random CV — the metric that mirrors the actual test — by a clear margin. The image investigation is a genuine finding, not a failed experiment: visual features add meaningful signal (+4.5pp) when product lines are completely unseen, confirming that the photos carry real information beyond the structured attributes, but that this information is largely redundant when the collection is already known.
 
 ---
 
 ## What Worked
 
-- **`col_mean` (EB-shrunk)** was the single most important feature. Shrinkage over raw mean is the right choice — it stabilises small collections without affecting large ones.
-- **`vol` (tile volume)** was the strongest raw numeric predictor. Volume captures what area alone misses: thickness drives manufacturing cost, shipping weight, and breakage risk.
-- **Finish keyword extraction** from product names outperformed the structured `finish_type` field. The structured field has 3 values; regex extraction yields 9 meaningful categories.
-- **Missingness flags** consistently ranked in the top features. The absence of a certification result is itself a strong signal about product tier.
-- **Log-transforming the target** was essential. Without it, the model over-optimises for the expensive tail and under-fits the dense $8–$15 cluster.
-- **Two CV schemes** revealed where images add value — not on the easy in-collection task, but on the harder generalisation task.
+- **EB-shrunk `col_mean`** was the single most important feature, and by a wide margin. Shrinkage over a raw mean was the right call — it stabilises thin collections without penalising large ones.
+- **Tile volume** beat tile area as the strongest raw numeric predictor, because thickness carries independent cost signal.
+- **Finish keyword extraction** from product names outperformed the structured `finish_type` field — 9 meaningful categories vs. 3.
+- **Missingness flags** consistently ranked in the top features. The absence of a lab certification is itself a strong indicator of product tier.
+- **Log target transformation** was essential. Without it, the model over-optimises for the expensive tail and under-fits the dense $8–$15 cluster.
+- **Running two CV schemes** gave a complete picture: random CV tells you the leaderboard number; GroupKFold tells you where the model's ceiling is and where additional signals (like images) would pay off.
 
-## What Didn't Work
+## What Didn't Work / What I'd Do Differently
 
-- **Image features didn't improve the in-distribution metric.** Five fusion strategies, two image representations — none moved the random CV metric. The structured features already encode the pricing logic; the photos are largely redundant when the collection is known.
-- **DINOv2 does help under GroupKFold**, but that's the harder, less common evaluation regime. Direct concatenation (PCA-reduced DINOv2 embeddings) gave the best result there.
-- **High-dimensional direct concatenation** of raw embeddings hurt more than it helped — the `direct` strategy was inferior to `base` on random CV. PCA reduction + noise introduced by irrelevant visual dimensions outweighed any signal.
-- **kNN price priors from images** added noise under distribution shift — when validation collections weren't seen in training, the kNN neighbours were less reliable.
-
----
-
-## What I'd Do With More Time
-
-1. **Contrastively fine-tune DINOv2 on tile images.** The current model uses a general-purpose encoder trained on internet photos. Fine-tuning with a loss that pulls same-collection tiles closer in embedding space would produce tile-specific visual features and might genuinely lift the GroupKFold metric.
-
-2. **Neural collection embeddings.** Instead of hand-crafted mean/std features, learn a low-dimensional embedding for each collection jointly with price prediction, capturing richer within-collection structure.
-
-3. **Extended hyperparameter search.** The current XGBoost/LightGBM parameters are reasonable defaults. A systematic Optuna search over 200+ trials across learning rate, depth, regularisation, and subsampling could squeeze out incremental gains.
-
-4. **Quantile models.** Instead of a point estimate, train models for the 10th and 90th percentile to produce calibrated price bands — more useful to a buyer than a single number.
-
-5. **Semi-supervised learning.** The 568 test-set images are available even though prices are hidden. These could improve PCA or DINOv2 embeddings without introducing label leakage.
+- **Image features didn't move the in-distribution metric.** Under random CV, no fusion strategy — direct concatenation, stacking, kNN price prior — improved on the tabular-only model. The collection encoding already saturates the signal that's available in the structured data; the photos don't add to what the model already knows about price tier.
+- **High-dimensional direct concatenation** (dumping all PCA-reduced image embeddings into the feature matrix) was slightly worse than baseline. The noise from irrelevant visual dimensions outweighed the signal. A compact representation (stacking or kNN) is cleaner.
+- **With more time**, I'd fine-tune DINOv2 on tile images using contrastive learning — pulling same-collection tiles closer in embedding space. Frozen embeddings from a general-purpose model are a good starting point, but tile-specific visual features would likely give a real lift in the GroupKFold regime, where images already show clear promise. I'd also run a systematic Optuna hyperparameter search over 200+ trials and experiment with quantile regression to produce calibrated price bands rather than point estimates.
