@@ -65,7 +65,7 @@ A full audit of the structured fields surfaced several categorical features that
 | `aspect` | max(w,l) / min(w,l) | Plank vs. square format pricing |
 | `finish_kw` | Regex from `product_name` | 9 categories; far more granular than the structured `finish_type` |
 | `app` | Parsed `application_location` | Wall+Floor vs. Wall-only and other combos |
-| `col_mean` | EB-shrunk mean log-price per collection (fold-safe) | Single most important feature by a wide margin |
+| `col_mean` | EB-shrunk mean log-price per collection (fold-safe) | Highly important target encoding for collection tier |
 | `col_std` | Std deviation per collection | Captures intra-collection price spread |
 | `col_cnt` | SKU count per collection | Feeds the shrinkage calculation |
 | `*_miss` flags | 1 if field is null, 0 if present | Missingness encodes product tier |
@@ -141,8 +141,8 @@ I also computed **22 compact, interpretable "look" features** directly from pixe
 
 ## What Worked
 
-- **EB-shrunk `col_mean`** was the single most important feature, and by a wide margin. Shrinkage over a raw mean was the right call — it stabilises thin collections without penalising large ones.
-- **Tile volume** beat tile area as the strongest raw numeric predictor, because thickness carries independent cost signal.
+- **Size and Edge Type** proved to be the strongest raw predictors (`area`, `vol`, `edge_type`). Larger tiles and specific edge finishes drive the baseline cost.
+- **EB-shrunk `col_mean`** remained a top-tier feature. Shrinkage over a raw mean was the right call — it stabilises thin collections without penalising large ones.
 - **Finish keyword extraction** from product names outperformed the structured `finish_type` field — 9 meaningful categories vs. 3.
 - **Missingness flags** consistently ranked in the top features. The absence of a lab certification is itself a strong indicator of product tier.
 - **Log target transformation** was essential. Without it, the model over-optimises for the expensive tail and under-fits the dense $8–$15 cluster.
